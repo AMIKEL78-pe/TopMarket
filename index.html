@@ -594,6 +594,13 @@ function addItem() {
 
   saveData();
 
+  // Aprendizaje local: si el producto tenía código de barras, lo guarda en el
+  // catálogo del dispositivo para que la próxima vez que se escanee el mismo
+  // código, la app lo reconozca al instante y sin necesidad de internet.
+  if (barcode) {
+    saveToLocalCatalog(barcode, name, price);
+  }
+
   // Reset formulario
   document.getElementById('item-name').value = '';
   document.getElementById('item-qty').value = 1;
@@ -785,8 +792,9 @@ function stopScanner() {
 }
 
 /**
- * Consulta la API de Open Food Facts para un código de barras recién escaneado
- * y autocompleta nombre / imagen del producto si existe en la base de datos.
+ * Consulta el catálogo local, luego Open Food Facts, y finalmente una API de
+ * respaldo, para un código de barras recién escaneado. Autocompleta nombre,
+ * precio (si el catálogo local lo tenía) e imagen si el producto existe.
  */
 async function handleScannedCode(decodedText) {
   document.getElementById('item-barcode').value = decodedText;
@@ -801,12 +809,15 @@ async function handleScannedCode(decodedText) {
   chipIcon.innerHTML = '<circle cx="12" cy="12" r="9" stroke-dasharray="42" stroke-dashoffset="14"><animateTransform attributeName="transform" type="rotate" from="0 12 12" to="360 12 12" dur="0.8s" repeatCount="indefinite"/></circle>';
   chipText.textContent = 'Buscando código ' + decodedText + '…';
 
-  const product = await fetchProductByBarcode(decodedText);
+  const product = await searchProduct(decodedText);
 
   if (product.found) {
-    // Producto encontrado: autocompleta nombre y foto de referencia.
-    const fullName = [product.name, product.brand].filter(Boolean).join(' — ');
-    document.getElementById('item-name').value = product.name || fullName;
+    // Producto encontrado (local, Open Food Facts o respaldo): autocompleta.
+    document.getElementById('item-name').value = product.name;
+
+    if (product.price > 0) {
+      document.getElementById('item-price').value = product.price;
+    }
 
     if (product.image) {
       currentPhotoBase64 = product.image;
@@ -818,24 +829,98 @@ async function handleScannedCode(decodedText) {
       document.getElementById('photo-label-text').textContent = 'Foto de Open Food Facts ✓';
     }
 
+    const sourceLabel = {
+      local: 'catálogo del dispositivo',
+      openfoodfacts: 'Open Food Facts',
+      upcitemdb: 'base de datos de respaldo'
+    }[product.source] || product.source;
+
     chipIcon.innerHTML = '<circle cx="12" cy="12" r="9"/><path d="m8.5 12.5 2.3 2.3 4.7-5.1"/>';
-    chipText.textContent = 'Encontrado: ' + fullName;
-    document.getElementById('item-price').focus();
-  } else if (product.error) {
-    // No se pudo conectar con el servicio (red bloqueada, sin internet, timeout).
-    chip.classList.remove('bg-emerald-50', 'text-emerald-700');
-    chip.classList.add('bg-red-50', 'text-red-700');
-    chipIcon.innerHTML = '<circle cx="12" cy="12" r="9"/><path d="M12 8v4"/><circle cx="12" cy="16" r="0.6" fill="currentColor" stroke="none"/>';
-    chipText.textContent = 'Sin conexión al servicio de productos — completa manualmente';
-    document.getElementById('item-name').focus();
+    chipText.textContent = `Encontrado (${sourceLabel}): ${product.name}`;
+    // Si vino del catálogo local ya tenemos nombre y precio: foco directo en cantidad.
+    document.getElementById(product.price > 0 ? 'item-qty' : 'item-price').focus();
   } else {
-    // Consulta exitosa pero el producto no está en la base de datos de Open Food Facts.
+    // No encontrado en ninguna fuente: se deja el código cargado para ingreso manual.
     chip.classList.remove('bg-emerald-50', 'text-emerald-700');
     chip.classList.add('bg-red-50', 'text-red-700');
     chipIcon.innerHTML = '<circle cx="12" cy="12" r="9"/><path d="M12 8v4"/><circle cx="12" cy="16" r="0.6" fill="currentColor" stroke="none"/>';
     chipText.textContent = 'Código ' + decodedText + ' no encontrado — completa manualmente';
     document.getElementById('item-name').focus();
   }
+}
+
+/* ---------------- Catálogo local de productos (aprendizaje offline) ---------------- */
+const LOCAL_CATALOG_KEY = 'topmarket_catalog';
+
+/** Lee el catálogo de productos guardados localmente por el usuario/la app. */
+function getLocalCatalog() {
+  try {
+    return JSON.parse(localStorage.getItem(LOCAL_CATALOG_KEY) || '{}');
+  } catch (e) {
+    console.error('Error leyendo catálogo local', e);
+    return {};
+  }
+}
+
+/** Guarda o actualiza un producto en el catálogo local por código de barras. */
+function saveToLocalCatalog(barcode, name, price = 0) {
+  try {
+    const catalog = getLocalCatalog();
+    catalog[barcode] = { name, price, updatedAt: new Date().toISOString() };
+    localStorage.setItem(LOCAL_CATALOG_KEY, JSON.stringify(catalog));
+  } catch (e) {
+    console.error('Error guardando en catálogo local', e);
+  }
+}
+
+/**
+ * Búsqueda multinivel de un producto por código de barras:
+ *   1. Catálogo local (instantáneo, funciona sin internet).
+ *   2. Open Food Facts (API pública).
+ *   3. UPCItemDB (respaldo opcional; puede fallar por CORS/límite de uso sin
+ *      afectar el resto del flujo, ya que está aislado en su propio try/catch).
+ */
+async function searchProduct(barcode) {
+  const cleanBarcode = String(barcode).trim();
+
+  // Paso 1: catálogo local.
+  const localCatalog = getLocalCatalog();
+  if (localCatalog[cleanBarcode]) {
+    return {
+      found: true,
+      source: 'local',
+      name: localCatalog[cleanBarcode].name,
+      price: localCatalog[cleanBarcode].price || 0,
+      image: null
+    };
+  }
+
+  // Paso 2: Open Food Facts (función ya existente y probada).
+  const offResult = await fetchProductByBarcode(cleanBarcode);
+  if (offResult.found) {
+    const fullName = [offResult.name, offResult.brand].filter(Boolean).join(' — ');
+    const finalName = offResult.name || fullName;
+    saveToLocalCatalog(cleanBarcode, finalName); // aprendizaje para la próxima vez
+    return { found: true, source: 'openfoodfacts', name: finalName, price: 0, image: offResult.image || null };
+  }
+
+  // Paso 3: API de respaldo (mejor esfuerzo — no crítica para el flujo).
+  try {
+    const backupRes = await fetch(`https://api.upcitemdb.com/prod/trial/lookup?upc=${cleanBarcode}`);
+    if (backupRes.ok) {
+      const backupData = await backupRes.json();
+      if (backupData.items && backupData.items.length > 0 && backupData.items[0].title) {
+        const backupName = backupData.items[0].title;
+        saveToLocalCatalog(cleanBarcode, backupName);
+        return { found: true, source: 'upcitemdb', name: backupName, price: 0, image: null };
+      }
+    }
+  } catch (error) {
+    console.warn('[UPCItemDB] Fallo en API de respaldo (no crítico):', error);
+  }
+
+  // Ninguna fuente tuvo el producto: se requiere ingreso manual.
+  return { found: false, barcode: cleanBarcode };
 }
 
 /**
