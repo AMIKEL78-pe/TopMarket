@@ -169,7 +169,7 @@
       </div>
 
       <div id="scanned-chip" class="hidden mb-3 flex items-center gap-2 bg-emerald-50 text-emerald-700 text-xs font-semibold px-3 py-2 rounded-xl">
-        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="m8.5 12.5 2.3 2.3 4.7-5.1"/></svg> <span id="scanned-code-text"></span>
+        <svg id="scanned-chip-icon" class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="m8.5 12.5 2.3 2.3 4.7-5.1"/></svg> <span id="scanned-code-text"></span>
         <button onclick="clearScannedCode()" class="ml-auto text-emerald-400"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 5l14 14"/><path d="M19 5 5 19"/></svg></button>
       </div>
 
@@ -561,7 +561,10 @@ function clearPhoto() {
 
 function clearScannedCode() {
   document.getElementById('item-barcode').value = '';
-  document.getElementById('scanned-chip').classList.add('hidden');
+  const chip = document.getElementById('scanned-chip');
+  chip.classList.add('hidden');
+  chip.classList.remove('bg-red-50', 'text-red-700');
+  chip.classList.add('bg-emerald-50', 'text-emerald-700');
 }
 
 function addItem() {
@@ -739,10 +742,8 @@ function startScanner() {
     { facingMode: 'environment' },
     config,
     (decodedText) => {
-      document.getElementById('item-barcode').value = decodedText;
-      document.getElementById('scanned-code-text').textContent = 'Código detectado: ' + decodedText;
-      document.getElementById('scanned-chip').classList.remove('hidden');
       stopScanner();
+      handleScannedCode(decodedText);
     },
     () => { /* error de frame — se ignora, es continuo */ }
   ).catch((err) => {
@@ -764,6 +765,122 @@ function stopScanner() {
     }).catch(() => { html5QrCode = null; });
   }
   closeModal('scanner-modal');
+}
+
+/**
+ * Consulta la API de Open Food Facts para un código de barras recién escaneado
+ * y autocompleta nombre / imagen del producto si existe en la base de datos.
+ */
+async function handleScannedCode(decodedText) {
+  document.getElementById('item-barcode').value = decodedText;
+
+  // Chip en estado "buscando..."
+  const chip = document.getElementById('scanned-chip');
+  const chipIcon = document.getElementById('scanned-chip-icon');
+  const chipText = document.getElementById('scanned-code-text');
+  chip.classList.remove('hidden');
+  chip.classList.remove('bg-red-50', 'text-red-700');
+  chip.classList.add('bg-emerald-50', 'text-emerald-700');
+  chipIcon.innerHTML = '<circle cx="12" cy="12" r="9" stroke-dasharray="42" stroke-dashoffset="14"><animateTransform attributeName="transform" type="rotate" from="0 12 12" to="360 12 12" dur="0.8s" repeatCount="indefinite"/></circle>';
+  chipText.textContent = 'Buscando código ' + decodedText + '…';
+
+  const product = await fetchProductByBarcode(decodedText);
+
+  if (product && (product.name || product.brand)) {
+    // Producto encontrado: autocompleta nombre y foto de referencia.
+    const fullName = [product.name, product.brand].filter(Boolean).join(' — ');
+    document.getElementById('item-name').value = product.name || fullName;
+
+    if (product.image) {
+      currentPhotoBase64 = product.image;
+      const preview = document.getElementById('photo-preview');
+      preview.src = product.image;
+      preview.classList.remove('hidden');
+      document.getElementById('photo-clear-btn').classList.remove('hidden');
+      document.getElementById('photo-clear-btn').classList.add('flex');
+      document.getElementById('photo-label-text').textContent = 'Foto de Open Food Facts ✓';
+    }
+
+    chipIcon.innerHTML = '<circle cx="12" cy="12" r="9"/><path d="m8.5 12.5 2.3 2.3 4.7-5.1"/>';
+    chipText.textContent = 'Encontrado: ' + fullName;
+    document.getElementById('item-price').focus();
+  } else {
+    // No encontrado en Open Food Facts: se deja el código cargado para ingreso manual.
+    chip.classList.remove('bg-emerald-50', 'text-emerald-700');
+    chip.classList.add('bg-red-50', 'text-red-700');
+    chipIcon.innerHTML = '<circle cx="12" cy="12" r="9"/><path d="M12 8v4"/><circle cx="12" cy="16" r="0.6" fill="currentColor" stroke="none"/>';
+    chipText.textContent = 'Código ' + decodedText + ' no encontrado — completa manualmente';
+    document.getElementById('item-name').focus();
+  }
+}
+
+/**
+ * Busca un producto por su código de barras en Open Food Facts.
+ * Documentación: https://openfoodfacts.github.io/openfoodfacts-server/api/
+ *
+ * @param {string} barcode - Código de barras EAN-13 (o similar) como string.
+ * @param {number} [timeoutMs=8000] - Tiempo máximo de espera antes de abortar la petición.
+ * @returns {Promise<{name: string, brand: string, image: string, barcode: string} | null>}
+ *          Objeto limpio con los datos del producto, o `null` si no se encontró
+ *          o si ocurrió un error de red/timeout (para permitir carga manual).
+ */
+async function fetchProductByBarcode(barcode, timeoutMs = 8000) {
+  const cleanBarcode = String(barcode).trim();
+  if (!/^\d{6,14}$/.test(cleanBarcode)) {
+    console.warn('[OpenFoodFacts] Código de barras con formato inválido:', barcode);
+    return null;
+  }
+
+  const url = `https://world.openfoodfacts.org/api/v2/product/${cleanBarcode}.json`;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        // Nota: "User-Agent" es un header prohibido en fetch/XHR — el navegador lo
+        // ignora y usa el suyo propio. Se deja documentado por buenas prácticas de
+        // la API, pero no tiene efecto real desde el navegador.
+        'User-Agent': 'TopMarketApp - Web - Version 1.0',
+        'Accept': 'application/json'
+      },
+      signal: controller.signal
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      console.error(`[OpenFoodFacts] Respuesta HTTP no válida: ${response.status}`);
+      return null;
+    }
+
+    const data = await response.json();
+
+    if (!data || data.status !== 1 || !data.product) {
+      console.info('[OpenFoodFacts] Producto no encontrado para el código:', cleanBarcode);
+      return null;
+    }
+
+    const product = data.product;
+
+    return {
+      barcode: cleanBarcode,
+      name: product.product_name_es || product.product_name || '',
+      brand: product.brands || '',
+      image: product.image_small_url || product.image_front_thumb_url || ''
+    };
+
+  } catch (error) {
+    clearTimeout(timeoutId);
+    if (error.name === 'AbortError') {
+      console.error('[OpenFoodFacts] La petición superó el tiempo de espera (timeout).');
+    } else {
+      console.error('[OpenFoodFacts] Error de red o de parseo:', error);
+    }
+    return null;
+  }
 }
 
 /* ---------------- Historial de compras ---------------- */
